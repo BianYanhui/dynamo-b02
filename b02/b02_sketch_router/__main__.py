@@ -1,20 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 BianYanhui
 # SPDX-License-Identifier: Apache-2.0
 
-"""B02 Sketch Router service.
+"""B02 selective KV-state gateway and Dynamo router service.
 
-A standalone Dynamo router component that fuses B02's cost-aware semantic
-state interface into Dynamo's native KV routing:
+The current B02 design follows the paper's control-plane model:
 
-    Client -> Frontend -> B02SketchRouter -> (pin | native KvRouter) -> workers
+    Instance reporter -> selective state gateway -> dispatcher hint
+    Client -> Frontend -> B02SketchRouter -> native KvRouter -> workers
 
-- Workflow identity rides `x-dynamo-session-id` (frontend injects
-  `agent_context.session_id`), with nvext/extra_args fallbacks.
-- Sketch-Dispatch policy (B02 §1.2) pins the workflow to its owning
-  instance unless that instance is overloaded; otherwise the native
-  Dynamo KvRouter chooses (keeping KV-overlap awareness).
-- Every tick, the Coarse/Rich/Sketch state views are built per instance
-  and their byte sizes logged to state_updates.jsonl (B02 §1.4).
+The native KvRouter remains the request/data-plane path.  The B02 gateway
+merges repeated extensions, gives invalidations priority, suppresses
+cross-instance replicas under a byte budget, and exposes an owner-side
+validation hook. Request affinity pinning is disabled by default because it
+is not the paper's mechanism; ``--legacy-affinity-pin`` is retained only for
+an explicit A/B comparison with v0.
 
 Usage:
     PYTHONPATH=<repo>/b02 python -m b02_sketch_router \
@@ -41,7 +40,12 @@ from dynamo.runtime import DistributedRuntime, dynamo_worker
 from dynamo.runtime.logging import configure_dynamo_logging
 
 from b02_sketch_router.policy import DispatchDecision, SketchDispatchPolicy, SketchPolicyConfig
-from b02_sketch_router.state_views import build_coarse, build_rich, build_sketch
+from b02_sketch_router.selective_signaling import (
+    KVStateUpdate,
+    OwnerStateRegistry,
+    SelectiveKVStateGateway,
+    updates_from_events,
+)
 from b02_sketch_router.workflow_state import WorkflowTable
 
 configure_dynamo_logging()
@@ -65,9 +69,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-inflight", type=int, default=8)
     ap.add_argument("--state-log-dir", default="/tmp/b02_state_logs")
     ap.add_argument("--tick-seconds", type=float, default=5.0,
-                    help="state-view accounting tick")
-    ap.add_argument("--kv-usage-placeholder", type=float, default=0.0,
-                    help="coarse view kv usage until worker telemetry is wired")
+                    help="gateway accounting tick")
+    ap.add_argument("--signal-budget-bytes-per-sec", type=int, default=64 * 1024,
+                    help="token-bucket budget for state signaling")
+    ap.add_argument("--signal-frame-bytes", type=int, default=64,
+                    help="fixed logical state frame size")
+    ap.add_argument("--signal-top-k", type=int, default=64,
+                    help="maximum candidate frames selected per drain")
+    ap.add_argument("--signal-theta-seconds", type=float, default=30.0,
+                    help="freshness decay constant in the admission utility")
+    ap.add_argument("--signal-byte-penalty", type=float, default=16.0,
+                    help="byte penalty lambda in the admission utility")
+    ap.add_argument("--legacy-affinity-pin", action="store_true",
+                    help="enable the old v0 workflow-to-worker pinning for A/B only")
     args = ap.parse_args()
     if args.served_model_name is None:
         args.served_model_name = f"{args.model_name}-b02"
@@ -149,6 +163,14 @@ class B02SketchRouterHandler:
         self._kv_router: Optional[KvRouter] = None
         self._worker_client = None
         self._table = WorkflowTable()
+        self._gateway = SelectiveKVStateGateway(
+            budget_bytes_per_sec=args.signal_budget_bytes_per_sec,
+            frame_bytes=args.signal_frame_bytes,
+            top_k=args.signal_top_k,
+            theta_seconds=args.signal_theta_seconds,
+            byte_penalty=args.signal_byte_penalty,
+        )
+        self._owner_states = OwnerStateRegistry()
         self._policy = SketchDispatchPolicy(SketchPolicyConfig(
             alpha=args.alpha, gamma=args.gamma,
             max_inflight_per_instance=args.max_inflight))
@@ -160,6 +182,8 @@ class B02SketchRouterHandler:
         self._stat_workflow = 0
         self._stat_passthrough = 0
         self._stat_pinned = 0
+        self._stat_native = 0
+        self._stat_signal_ingress = 0
         os.makedirs(args.state_log_dir, exist_ok=True)
         self._state_log = open(os.path.join(args.state_log_dir, "state_updates.jsonl"), "a")
         self._decision_log = open(os.path.join(args.state_log_dir, "decisions.jsonl"), "a")
@@ -212,6 +236,7 @@ class B02SketchRouterHandler:
             logger.info("b02.request_keys keys=%s", sorted(request.keys()))
 
         self._stat_total += 1
+        self._ingest_request_state(request)
         workflow_id, source = _extract_workflow_id(request)
         preprocessed = _wrap_preprocessed_request(request)
         decision: DispatchDecision
@@ -231,8 +256,17 @@ class B02SketchRouterHandler:
         rec.advance_step(tool_name=None, tool_result_tokens=0)
 
         candidates = self._candidates() or list(self._inflight.keys())
-        decision = self._policy.decide(self._table, workflow_id,
-                                       dict(self._inflight), candidates)
+        if self._args.legacy_affinity_pin:
+            decision = self._policy.decide(self._table, workflow_id,
+                                           dict(self._inflight), candidates)
+        else:
+            self._stat_native += 1
+            decision = DispatchDecision(
+                workflow_id=workflow_id,
+                pin_instance=None,
+                reason="native_kv",
+                owner_instance=rec.last_assigned_instance,
+            )
         if decision.pin_instance is not None:
             self._stat_pinned += 1
             routing = preprocessed.get("routing") or {}
@@ -277,7 +311,7 @@ class B02SketchRouterHandler:
             self._log_decision(decision, actual_worker=actual_worker, ttft_ms=ttft_ms,
                                completion_tokens=completion_tokens)
             try:
-                self._emit_state_views()   # per-request sample (B02 state update)
+                self._emit_signal_snapshot()   # per-request gateway sample
             except Exception as exc:  # noqa: BLE001
                 logger.debug("state view emit failed: %s", exc)
 
@@ -286,39 +320,112 @@ class B02SketchRouterHandler:
         while True:
             await asyncio.sleep(self._args.tick_seconds)
             try:
-                self._emit_state_views()
+                self._emit_signal_snapshot()
             except Exception as exc:  # noqa: BLE001
                 logger.debug("state accounting tick failed: %s", exc)
 
-    def _emit_state_views(self) -> None:
-        candidates = self._candidates()
-        if not candidates:
-            return
-        n = len(candidates)
-        # affinity_hot_counts keyed by REAL instance ids (they are large u64s,
-        # not 0..n-1) in candidate order for the sketch packing.
-        hot_by_id = {inst: 0 for inst in candidates}
-        for w in self._table.all():
-            if w.last_assigned_instance in hot_by_id:
-                hot_by_id[w.last_assigned_instance] += 1
-        hot = [hot_by_id[i] for i in candidates]
-        ts = time.time_ns()
-        for inst in candidates:
-            wfs = self._table.workflows_of(inst)
-            coarse = build_coarse(num_waiting=0,
-                                  num_running=self._inflight.get(inst, 0),
-                                  kv_usage_perc=self._args.kv_usage_placeholder)
-            rich = build_rich(wfs)
-            sketch = build_sketch(wfs, n, hot)
-            rec = {
-                "ts_ns": ts,
-                "instance": inst,
-                "active_workflows": len(wfs),
-                "bytes": {"coarse": len(coarse), "rich": len(rich),
-                          "sketch": len(sketch)},
-            }
-            self._state_log.write(json.dumps(rec) + "\n")
+    def _emit_signal_snapshot(self) -> None:
+        rec = {
+            "ts_ns": time.time_ns(),
+            "gateway": self._gateway.snapshot(),
+            "owner_states": self._owner_states.size,
+            "router": {
+                "workflows_tracked": len(self._table),
+                "inflight": dict(self._inflight),
+                "legacy_affinity_pin": self._args.legacy_affinity_pin,
+            },
+        }
+        self._state_log.write(json.dumps(rec) + "\n")
         self._state_log.flush()
+
+    def _ingest_request_state(self, request: dict[str, Any]) -> None:
+        """Accept optional reporter metadata without changing normal requests."""
+        events = request.get("kv_state_events")
+        if not isinstance(events, list):
+            return
+        for event in events:
+            if isinstance(event, dict):
+                self._record_owner_report(event)
+        accepted = updates_from_events(events, gateway=self._gateway)
+        self._stat_signal_ingress += len(events)
+        if accepted:
+            self._emit_signal_snapshot()
+
+    def _state_update_from_mapping(self, mapping: dict[str, Any]) -> Optional[KVStateUpdate]:
+        prefix = mapping.get("prefix_hash")
+        if prefix is None:
+            return None
+        kind = str(mapping.get("kind", mapping.get("type", "upsert"))).lower()
+        kind = "invalidate" if kind in {"removed", "blockremoved", "invalidate", "tombstone"} else "upsert"
+        return KVStateUpdate(
+            prefix_hash=str(prefix),
+            owner_instance=int(mapping.get("owner_instance", mapping.get("worker_id", 0))),
+            compatibility_scope=str(mapping.get("compatibility_scope", mapping.get("scope", "default"))),
+            coverage_tokens=int(mapping.get("coverage_tokens", mapping.get("coverage", 0))),
+            version=int(mapping.get("version", mapping.get("event_id", 0))),
+            generated_at_ns=int(mapping.get("generated_at_ns", time.time_ns())),
+            kind=kind,
+            frame_bytes=int(mapping.get("frame_bytes", self._args.signal_frame_bytes)),
+        )
+
+    def _record_owner_report(self, event: dict[str, Any]) -> None:
+        """Record reporter truth separately from the gateway's visible hints."""
+        update = self._state_update_from_mapping(event)
+        owner = int(event.get("owner_instance", event.get("worker_id", 0)))
+        kind = str(event.get("kind", event.get("type", "upsert"))).lower()
+        if kind in {"allblockscleared", "cleared", "clear"}:
+            self._owner_states.clear_owner(owner)
+        elif update is not None:
+            self._owner_states.record(update, resident=not update.is_invalidation)
+
+    async def ingest_kv_state(self, request: Optional[dict[str, Any]] = None):
+        """Gateway ingress/egress endpoint for semantic KV-state frames.
+
+        Returned frames are dispatcher hints. They are never authorization for
+        reuse; the owner must validate the hint before pinning any blocks.
+        """
+        payload = request or {}
+        events = payload.get("events")
+        if not isinstance(events, list):
+            events = [payload]
+        accepted = updates_from_events(events, gateway=self._gateway)
+        self._stat_signal_ingress += len(events)
+        for event in events:
+            if isinstance(event, dict):
+                self._record_owner_report(event)
+        frames = self._gateway.select(
+            budget_bytes=payload.get("budget_bytes"),
+            top_k=payload.get("top_k"),
+        )
+        validation_results = []
+        for hint in payload.get("validate", []):
+            if not isinstance(hint, dict):
+                continue
+            update = self._state_update_from_mapping(hint)
+            if update is None:
+                validation_results.append({"valid": False, "reason": "missing_prefix_hash"})
+                continue
+            result = self._owner_states.validate(
+                update, expected_scope=hint.get("expected_scope"),
+            )
+            self._gateway.stats.validation_attempts += 1
+            if not result.valid:
+                self._gateway.stats.validation_fallbacks += 1
+            validation_results.append({
+                "prefix_hash": update.prefix_hash,
+                "owner_instance": update.owner_instance,
+                "valid": result.valid,
+                "reason": result.reason,
+                "actual_version": result.actual_version,
+                "actual_coverage_tokens": result.actual_coverage_tokens,
+            })
+        self._emit_signal_snapshot()
+        yield {
+            "accepted": accepted,
+            "frames": [frame.as_dict() for frame in frames],
+            "validation": validation_results,
+            "gateway": self._gateway.snapshot(),
+        }
 
     def _log_decision(self, decision: DispatchDecision, actual_worker: Optional[int],
                       ttft_ms: Optional[float], completion_tokens: int = 0) -> None:
@@ -347,8 +454,12 @@ class B02SketchRouterHandler:
                 "workflow": self._stat_workflow,
                 "passthrough": self._stat_passthrough,
                 "pinned": self._stat_pinned,
+                "native_kv": self._stat_native,
             },
             "inflight": dict(self._inflight),
+            "signal_gateway": self._gateway.snapshot(),
+            "signal_ingress_events": self._stat_signal_ingress,
+            "legacy_affinity_pin": self._args.legacy_affinity_pin,
         }
 
 
@@ -363,6 +474,7 @@ async def worker(runtime: DistributedRuntime) -> None:
 
     generate_endpoint = runtime.endpoint(f"{args.namespace}.b02_sketch_router.generate")
     status_endpoint = runtime.endpoint(f"{args.namespace}.b02_sketch_router.status")
+    signal_endpoint = runtime.endpoint(f"{args.namespace}.b02_sketch_router.kv_state")
 
     model_path = args.model_path or args.model_name
     reg_kwargs = dict(
@@ -391,6 +503,10 @@ async def worker(runtime: DistributedRuntime) -> None:
                 handler.status,
                 graceful_shutdown=True,
                 metrics_labels=[("service", "b02_sketch_router")]),
+            signal_endpoint.serve_endpoint(
+                handler.ingest_kv_state,
+                graceful_shutdown=True,
+                metrics_labels=[("service", "b02_selective_state_gateway")]),
         )
     finally:
         await handler.shutdown()

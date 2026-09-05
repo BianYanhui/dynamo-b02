@@ -1,66 +1,73 @@
-# B02 Sketch Router — B02 语义状态接口融入 Dynamo
+# B02v1 — Selective KV-State Signaling in Dynamo
 
-> Fork: BianYanhui/dynamo-b02 · 分支: `b02-fusion` · 基于 Dynamo 1.4.2 运行时 (PyPI wheel) 开发
+> Fork: `BianYanhui/dynamo-b02` · branch: `b02-fusion` · Dynamo 1.4.2
 
-## 这是什么
+## Design alignment
 
-把 B02 的核心思想——**Instance–Dispatcher 边界应当暴露代价感知的语义状态视图**——
-实现为 Dynamo 的一个原生路由组件：
+B02v1 follows the latest paper, *Selective KV-State Signaling for Cache-Aware
+Edge LLM Dispatch*. The main mechanism is a gateway on the Instance–Dispatcher
+control path, not request-session affinity:
 
-```
-Client ──HTTP──> Frontend ──预处理──> B02SketchRouter ──direct/pin──> vLLM workers (4×T4)
-                    │                    │
-                    │              ┌─────┴──────────────────────────┐
-                    │              │ 1. WorkflowTable  (B02 §11)     │
-                    │              │ 2. Sketch-Dispatch (B02 §1.2)   │
-                    │              │ 3. Coarse/Rich/Sketch 视图字节   │
-                    │              │    会计 (B02 §1.4, 冻结字段)      │
-                    │              └────────────────────────────────┘
+```text
+Instance reporter ──semantic KV updates──> selective gateway ──hints──> dispatcher
+Client ──HTTP──> Frontend ──tokens──> B02 router ──native KvRouter──> vLLM workers
 ```
 
-- **工作流身份**：客户端带 `x-dynamo-session-id` 头 → 前端注入 `agent_context.session_id`
-  → router 以其作为 workflow_id（无头请求走原生 KvRouter 透传）
-- **Sketch-Dispatch**（B02 design.md §1.2）：`score(I) = α·inflight(I) + γ·affinity(I,R)`，
-  亲和项来自 WorkflowTable（该工作流的上一个步骤落在哪个实例）；命中亲和且实例
-  未过载 → 以 `routing.backend_instance_id` 钉住（Dynamo 原生钉定机制）；否则交给
-  原生 KvRouter（保留 Dynamo 的 KV-overlap 能力）并记录实际选择
-- **三视图字节会计**（B02 design.md §1.4 冻结字段）：每个 tick 对每个实例构建
-  Coarse / Rich / Sketch 三种状态视图并测量序列化字节数，写入
-  `state_updates.jsonl`——B02 的头条度量（Sketch≈Coarse≪Rich）在工业系统内复现
+The gateway applies four rules:
 
-## 与 ThunderAgent 的关系
+1. **Supersession aggregation** keeps only the newest unsent update for an
+   owner/prefix. Repeated extensions therefore become one frame carrying the
+   final coverage.
+2. **Invalidation priority** lets removal/restart tombstones bypass ordinary
+   upserts, reducing stale-positive exposure.
+3. **Cross-instance redundancy suppression** drops an equal-or-weaker replica
+   when a compatible copy is already visible elsewhere, while preserving new
+   coverage.
+4. **Freshness-aware budget admission** ranks candidates using
+   `exp(-(age + backlog_delay) / theta) * coverage - lambda * bytes` under a
+   token-bucket byte budget. The default frame is 64 B, `theta=30 s`, and
+   `lambda=16`, matching the paper's evaluation parameters.
 
-接线模式（`KvRouter` 包装、`register_model` 注册模型面、`routing.backend_instance_id`
-钉定、chunk 中 `routing_data.worker_id` 归因）复用 `dynamo.thunderagent_router` 的
-公开模式；策略与状态会计完全来自 B02。
+The dispatcher treats a frame as a hint. `OwnerStateRegistry` validates owner,
+compatibility scope, version, physical residency, and coverage before reuse;
+failure is a normal prefill fallback and never an unsafe reuse.
 
-## 目录
+## What is live in this fork
 
-```
-b02/
-├── README.md                  # 本文件
-├── b02_sketch_router/
-│   ├── __main__.py            # 服务接线（Dynamo 组件）
-│   ├── workflow_state.py      # WorkflowRecord / WorkflowTable (B02 §11)
-│   ├── state_views.py         # Coarse/Rich/Sketch 构建器 + 字节会计 (B02 §1.4)
-│   └── policy.py              # Sketch-Dispatch 评分 (B02 §1.2)
-├── tests/test_state_views.py  # 视图构建器单测（纯 Python）
-└── smoke/
-    ├── run_smoke.sh           # 一键冒烟：集群 → router → 负载 → 分析
-    ├── smoke_client.py        # agentic 负载客户端（带会话头）
-    └── analyze_smoke.py       # 粘性/复用/视图字节 汇总
-```
+- `b02_sketch_router/selective_signaling.py` contains the gateway, event
+  adapter, token-bucket admission, and owner-side validation registry.
+- `b02_sketch_router/__main__.py` keeps Dynamo's native `KvRouter` request path,
+  disables the old workflow pin by default, and exposes the internal endpoint
+  `dynamo.b02_sketch_router.kv_state` for reporter events.
+- `state_updates.jsonl` records gateway pending/visible state and signaling
+  counters. `status` exposes the same snapshot.
+- `--legacy-affinity-pin` is an explicit v0 A/B switch; it is off by default.
 
-## 运行
+The Python gateway is the paper-aligned control-plane prototype. Dynamo's
+native worker event plane is still the final production indexer path; wiring a
+deployment's reporter to the `kv_state` ingress is required to feed live
+semantic metadata into the gateway. Raw `BlockStored`/`BlockRemoved` events
+are accepted conservatively, but reporters should provide a stable
+`prefix_hash`, `owner_instance`, `compatibility_scope`, `coverage_tokens`, and
+monotonic `version`.
+
+## Tests
+
+On yhs1:
 
 ```bash
-bash /home/byh/Dynamo/cluster_up.sh                 # 4×vLLM worker + frontend
-bash /home/byh/Dynamo/dynamo/b02/smoke/run_smoke.sh # router + 冒烟 + 分析
-bash /home/byh/Dynamo/cluster_down.sh               # 收尾释放 GPU
+cd /home/byh/Dynamo/dynamo
+source /home/byh/Dynamo/.venv-dynamo/bin/activate
+PYTHONPATH=b02 python b02/tests/test_selective_signaling.py
+PYTHONPATH=b02 python b02/tests/test_state_views.py  # legacy builder regression
 ```
 
-冒烟判定（详见 smoke/README 注释）：
-1. 全部请求 200 且响应合法
-2. 同工作流步骤粘性（decisions.jsonl 中 source=pin 比例 & worker 一致性）
-3. `state_updates.jsonl`：sketch_bytes ≈ coarse_bytes ≪ rich_bytes（B02 头条复现）
-4. cached_tokens 随步骤增长（前缀复用经钉定路由得以发生）
+For the full smoke test, start the existing four-worker cluster and run:
+
+```bash
+bash /home/byh/Dynamo/dynamo/b02/smoke/run_smoke.sh
+```
+
+The default smoke path now measures native KV routing plus the gateway
+control-plane counters. Use `--legacy-affinity-pin` in the router command only
+when reproducing the old v0 comparison.

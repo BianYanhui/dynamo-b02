@@ -21,6 +21,10 @@ fi
 
 echo "[2/5] start b02 sketch router"
 mkdir -p $STATE_DIR
+# Each run must be self-contained; stale v0 decisions would otherwise make
+# the analyzer report affinity pins that did not happen in this run.
+rm -f "$STATE_DIR"/state_updates.jsonl "$STATE_DIR"/decisions.jsonl \
+      "$STATE_DIR"/smoke_results.jsonl
 pkill -f 'b02_sketch[_]router' 2>/dev/null; sleep 1
 # Wait out file-discovery removal propagation: the frontend's worker pool
 # keeps a dead handler for ~8s; requests routed there fail with 500.
