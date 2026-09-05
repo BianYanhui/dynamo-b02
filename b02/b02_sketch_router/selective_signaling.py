@@ -46,6 +46,7 @@ class KVStateUpdate:
     generated_at_ns: int = field(default_factory=time.time_ns)
     kind: str = "upsert"  # upsert | invalidate
     frame_bytes: int = DEFAULT_FRAME_BYTES
+    raw_event: Mapping[str, Any] | None = None
 
     @property
     def key(self) -> tuple[int, str, str]:
@@ -152,6 +153,7 @@ class SelectiveKVStateGateway:
                 generated_at_ns=update.generated_at_ns,
                 kind=update.kind,
                 frame_bytes=self.frame_bytes,
+                raw_event=update.raw_event,
             )
         self.stats.received += 1
         if update.is_invalidation:
@@ -179,6 +181,13 @@ class SelectiveKVStateGateway:
         # unsent candidate must not hide a copy that the dispatcher cannot yet
         # observe.
         visible = self._visible.get(update.prefix_key, {})
+        same_owner = visible.get(update.owner_instance)
+        if same_owner is not None and (
+            same_owner.coverage_tokens >= update.coverage_tokens
+            and same_owner.version >= update.version
+        ):
+            self.stats.superseded += 1
+            return False
         for owner, existing in visible.items():
             if owner != update.owner_instance and (
                 existing.coverage_tokens >= update.coverage_tokens
@@ -223,7 +232,7 @@ class SelectiveKVStateGateway:
             # chain.  Removed events generally lack it, so each block is a
             # conservative invalidation target.
             parent = event.get("parent_block_hash")
-            prefixes = [parent] if parent is not None and kind == "upsert" else block_hashes
+            prefixes = [parent] if parent is not None and kind == "upsert" else [block_hashes[0]]
         else:
             return 0
 
@@ -242,6 +251,7 @@ class SelectiveKVStateGateway:
                 generated_at_ns=now_ns,
                 kind=kind,
                 frame_bytes=frame_bytes,
+                raw_event=dict(event),
             )
             accepted += int(self.ingest(update))
         return accepted
@@ -341,9 +351,6 @@ class SelectiveKVStateGateway:
             scored.append((utility, key, update))
         scored.sort(key=lambda row: (row[0], row[2].coverage_tokens, row[2].version), reverse=True)
         for utility, key, update in scored[:remaining]:
-            if utility <= 0:
-                self.stats.budget_deferred += 1
-                continue
             selected.append(update)
             del self._pending_upserts[key]
             self._mark_visible(update)

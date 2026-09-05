@@ -47,6 +47,7 @@ from b02_sketch_router.selective_signaling import (
     updates_from_events,
 )
 from b02_sketch_router.workflow_state import WorkflowTable
+from b02_sketch_router.zmq_gateway import RawZmqSelectiveRelay
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
@@ -82,6 +83,10 @@ def parse_args() -> argparse.Namespace:
                     help="byte penalty lambda in the admission utility")
     ap.add_argument("--legacy-affinity-pin", action="store_true",
                     help="enable the old v0 workflow-to-worker pinning for A/B only")
+    ap.add_argument("--zmq-relay-ports", default=None,
+                    help="comma-separated vLLM raw ZMQ ports to relay through B02")
+    ap.add_argument("--zmq-relay-scope", default="default",
+                    help="compatibility scope attached to relayed KV state")
     args = ap.parse_args()
     if args.served_model_name is None:
         args.served_model_name = f"{args.model_name}-b02"
@@ -171,6 +176,7 @@ class B02SketchRouterHandler:
             byte_penalty=args.signal_byte_penalty,
         )
         self._owner_states = OwnerStateRegistry()
+        self._zmq_relay: Optional[RawZmqSelectiveRelay] = None
         self._policy = SketchDispatchPolicy(SketchPolicyConfig(
             alpha=args.alpha, gamma=args.gamma,
             max_inflight_per_instance=args.max_inflight))
@@ -201,6 +207,29 @@ class B02SketchRouterHandler:
             # 1.4.2 binding signature fallback
             self._kv_router = KvRouter(worker_endpoint, self._args.router_block_size)
         self._worker_client = await worker_endpoint.client()
+        if self._args.zmq_relay_ports:
+            ports = [int(port) for port in self._args.zmq_relay_ports.split(",") if port.strip()]
+            worker_ids: list[int] = []
+            for _ in range(30):
+                worker_ids = self._candidates()
+                if len(worker_ids) >= len(ports):
+                    break
+                await asyncio.sleep(1.0)
+            if len(worker_ids) != len(ports):
+                raise RuntimeError(
+                    f"B02 ZMQ relay expected {len(ports)} workers, found {worker_ids}"
+                )
+            self._zmq_relay = RawZmqSelectiveRelay(
+                endpoint=worker_endpoint,
+                worker_ids=worker_ids,
+                ports=ports,
+                block_size=self._args.router_block_size,
+                gateway=self._gateway,
+                compatibility_scope=self._args.zmq_relay_scope,
+            )
+            self._zmq_relay.start()
+            logger.info("B02 ZMQ selective relay started (workers=%s, ports=%s)",
+                        worker_ids, ports)
         logger.info("B02 sketch router initialized (endpoint=%s, block_size=%s)",
                     self._args.endpoint, self._args.router_block_size)
         self._tick_task = asyncio.create_task(self._state_accounting_loop())
@@ -212,6 +241,9 @@ class B02SketchRouterHandler:
                 await self._tick_task
             except asyncio.CancelledError:
                 pass
+        if self._zmq_relay is not None:
+            self._zmq_relay.shutdown()
+            self._zmq_relay = None
         self._state_log.close()
         self._decision_log.close()
         logger.info("B02 sketch router shutdown complete")
@@ -329,6 +361,7 @@ class B02SketchRouterHandler:
             "ts_ns": time.time_ns(),
             "gateway": self._gateway.snapshot(),
             "owner_states": self._owner_states.size,
+            "relay": self._zmq_relay.snapshot() if self._zmq_relay is not None else None,
             "router": {
                 "workflows_tracked": len(self._table),
                 "inflight": dict(self._inflight),
@@ -458,6 +491,7 @@ class B02SketchRouterHandler:
             },
             "inflight": dict(self._inflight),
             "signal_gateway": self._gateway.snapshot(),
+            "zmq_relay": self._zmq_relay.snapshot() if self._zmq_relay is not None else None,
             "signal_ingress_events": self._stat_signal_ingress,
             "legacy_affinity_pin": self._args.legacy_affinity_pin,
         }

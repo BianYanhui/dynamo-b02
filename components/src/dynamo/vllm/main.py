@@ -461,6 +461,16 @@ def setup_kv_event_publisher(
         )
         return None
 
+    # B02 can take ownership of the raw vLLM ZMQ stream and republish
+    # selectively through its own KvEventPublisher.  Keep vLLM's raw event
+    # producer enabled, but avoid creating the ordinary worker-side relay so
+    # the dispatcher cannot subscribe to both the raw and filtered paths.
+    if os.environ.get("DYN_B02_EVENT_GATEWAY", "0") == "1":
+        logger.info(
+            "DYN_B02_EVENT_GATEWAY=1: deferring KV event relay to the B02 gateway"
+        )
+        return None
+
     # Get DP rank range managed by this worker to create publishers for corresponding dp_ranks,
     # all served workers should cover all ranks.
     dp_start, dp_size = get_dp_range_for_worker(vllm_config)
