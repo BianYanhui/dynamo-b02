@@ -51,6 +51,14 @@ are accepted conservatively, but reporters should provide a stable
 `prefix_hash`, `owner_instance`, `compatibility_scope`, `coverage_tokens`, and
 monotonic `version`.
 
+For high raw-event rates, use `--zmq-relay-shards N` with one shard per
+Worker/DP source group. Each shard runs in a separate process so raw-event
+receive, decode, merge, and publish can use separate CPU cores. The default
+single-process mode preserves global cross-instance redundancy suppression;
+process-sharded mode keeps owner-side validation safety but performs
+redundancy suppression within each shard. Use sharding only when raw ingress
+is the limiting factor and validate the resulting downstream hint volume.
+
 ## Tests
 
 On yhs1:
@@ -59,6 +67,7 @@ On yhs1:
 cd /home/byh/Dynamo/dynamo
 source /home/byh/Dynamo/.venv-dynamo/bin/activate
 PYTHONPATH=b02 python b02/tests/test_selective_signaling.py
+PYTHONPATH=b02 python b02/tests/test_zmq_gateway.py
 PYTHONPATH=b02 python b02/tests/test_state_views.py  # legacy builder regression
 ```
 

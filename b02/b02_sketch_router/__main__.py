@@ -30,6 +30,8 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+import sys
 import time
 from typing import Any, Optional
 
@@ -87,7 +89,15 @@ def parse_args() -> argparse.Namespace:
                     help="comma-separated vLLM raw ZMQ ports to relay through B02")
     ap.add_argument("--zmq-relay-scope", default="default",
                     help="compatibility scope attached to relayed KV state")
+    ap.add_argument("--zmq-relay-shards", type=int, default=1,
+                    help="number of process-sharded raw relays; >1 avoids the Python GIL")
+    ap.add_argument("--zmq-relay-recv-hwm", type=int, default=200_000)
+    ap.add_argument("--zmq-relay-max-messages-per-poll", type=int, default=512)
+    ap.add_argument("--zmq-relay-max-events-per-batch", type=int, default=4096)
+    ap.add_argument("--zmq-relay-drain-interval-ms", type=float, default=2.0)
     args = ap.parse_args()
+    if args.zmq_relay_shards <= 0:
+        ap.error("--zmq-relay-shards must be positive")
     if args.served_model_name is None:
         args.served_model_name = f"{args.model_name}-b02"
     ns = args.endpoint.split(".")[0] if "." in args.endpoint else "dynamo"
@@ -177,6 +187,9 @@ class B02SketchRouterHandler:
         )
         self._owner_states = OwnerStateRegistry()
         self._zmq_relay: Optional[RawZmqSelectiveRelay] = None
+        self._zmq_relay_processes: list[subprocess.Popen] = []
+        self._zmq_relay_ready_files: list[str] = []
+        self._zmq_relay_stats_files: list[str] = []
         self._policy = SketchDispatchPolicy(SketchPolicyConfig(
             alpha=args.alpha, gamma=args.gamma,
             max_inflight_per_instance=args.max_inflight))
@@ -219,17 +232,24 @@ class B02SketchRouterHandler:
                 raise RuntimeError(
                     f"B02 ZMQ relay expected {len(ports)} workers, found {worker_ids}"
                 )
-            self._zmq_relay = RawZmqSelectiveRelay(
-                endpoint=worker_endpoint,
-                worker_ids=worker_ids,
-                ports=ports,
-                block_size=self._args.router_block_size,
-                gateway=self._gateway,
-                compatibility_scope=self._args.zmq_relay_scope,
-            )
-            self._zmq_relay.start()
-            logger.info("B02 ZMQ selective relay started (workers=%s, ports=%s)",
-                        worker_ids, ports)
+            if self._args.zmq_relay_shards == 1:
+                self._zmq_relay = RawZmqSelectiveRelay(
+                    endpoint=worker_endpoint,
+                    worker_ids=worker_ids,
+                    ports=ports,
+                    block_size=self._args.router_block_size,
+                    gateway=self._gateway,
+                    compatibility_scope=self._args.zmq_relay_scope,
+                    recv_hwm=self._args.zmq_relay_recv_hwm,
+                    max_messages_per_poll=self._args.zmq_relay_max_messages_per_poll,
+                    max_events_per_batch=self._args.zmq_relay_max_events_per_batch,
+                    drain_interval_ms=self._args.zmq_relay_drain_interval_ms,
+                )
+                self._zmq_relay.start()
+                logger.info("B02 ZMQ selective relay started (workers=%s, ports=%s)",
+                            worker_ids, ports)
+            else:
+                self._start_sharded_relays(worker_ids, ports)
         logger.info("B02 sketch router initialized (endpoint=%s, block_size=%s)",
                     self._args.endpoint, self._args.router_block_size)
         self._tick_task = asyncio.create_task(self._state_accounting_loop())
@@ -244,9 +264,125 @@ class B02SketchRouterHandler:
         if self._zmq_relay is not None:
             self._zmq_relay.shutdown()
             self._zmq_relay = None
+        for process in self._zmq_relay_processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in self._zmq_relay_processes:
+            try:
+                process.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1.0)
+        self._zmq_relay_processes.clear()
+        for path in self._zmq_relay_ready_files + self._zmq_relay_stats_files:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        self._zmq_relay_ready_files.clear()
+        self._zmq_relay_stats_files.clear()
         self._state_log.close()
         self._decision_log.close()
         logger.info("B02 sketch router shutdown complete")
+
+    def _start_sharded_relays(self, worker_ids: list[int], ports: list[int]) -> None:
+        """Start independent relay processes, one shard per worker subset.
+
+        Each shard owns its local admission state.  This preserves the
+        owner-side validation safety rule while allowing raw-event processing
+        to use multiple cores; cross-shard redundancy suppression is best
+        effort in this explicit performance mode.
+        """
+        shard_count = min(self._args.zmq_relay_shards, len(worker_ids))
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        package_root = os.path.join(repo_root, "b02")
+        inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+        pythonpath = package_root
+        if inherited_pythonpath:
+            pythonpath = f"{package_root}{os.pathsep}{inherited_pythonpath}"
+
+        for shard in range(shard_count):
+            shard_workers = worker_ids[shard::shard_count]
+            shard_ports = ports[shard::shard_count]
+            ready_file = os.path.join(
+                self._args.state_log_dir, f"zmq_relay_shard_{shard}.ready"
+            )
+            stats_file = os.path.join(
+                self._args.state_log_dir, f"zmq_relay_shard_{shard}.json"
+            )
+            for path in (ready_file, stats_file):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            command = [
+                sys.executable,
+                "-m",
+                "b02_sketch_router.relay_worker",
+                "--endpoint",
+                self._args.endpoint,
+                "--worker-ids",
+                ",".join(str(value) for value in shard_workers),
+                "--ports",
+                ",".join(str(value) for value in shard_ports),
+                "--block-size",
+                str(self._args.router_block_size),
+                "--scope",
+                self._args.zmq_relay_scope,
+                "--budget-bytes-per-sec",
+                str(self._args.signal_budget_bytes_per_sec),
+                "--frame-bytes",
+                str(self._args.signal_frame_bytes),
+                "--top-k",
+                str(self._args.signal_top_k),
+                "--theta-seconds",
+                str(self._args.signal_theta_seconds),
+                "--byte-penalty",
+                str(self._args.signal_byte_penalty),
+                "--recv-hwm",
+                str(self._args.zmq_relay_recv_hwm),
+                "--max-messages-per-poll",
+                str(self._args.zmq_relay_max_messages_per_poll),
+                "--max-events-per-batch",
+                str(self._args.zmq_relay_max_events_per_batch),
+                "--drain-interval-ms",
+                str(self._args.zmq_relay_drain_interval_ms),
+                "--ready-file",
+                ready_file,
+                "--stats-file",
+                stats_file,
+            ]
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = pythonpath
+            process = subprocess.Popen(command, cwd=repo_root, env=environment)
+            self._zmq_relay_processes.append(process)
+            self._zmq_relay_ready_files.append(ready_file)
+            self._zmq_relay_stats_files.append(stats_file)
+            logger.info("B02 ZMQ relay shard started (pid=%s, workers=%s, ports=%s)",
+                        process.pid, shard_workers, shard_ports)
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if all(os.path.exists(path) for path in self._zmq_relay_ready_files):
+                return
+            time.sleep(0.05)
+        for process in self._zmq_relay_processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in self._zmq_relay_processes:
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        self._zmq_relay_processes.clear()
+        for path in self._zmq_relay_ready_files + self._zmq_relay_stats_files:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        self._zmq_relay_ready_files.clear()
+        self._zmq_relay_stats_files.clear()
+        raise RuntimeError("timed out waiting for process-sharded B02 relays")
 
     def _candidates(self) -> list[int]:
         try:
@@ -361,7 +497,7 @@ class B02SketchRouterHandler:
             "ts_ns": time.time_ns(),
             "gateway": self._gateway.snapshot(),
             "owner_states": self._owner_states.size,
-            "relay": self._zmq_relay.snapshot() if self._zmq_relay is not None else None,
+            "relay": self._relay_snapshot(),
             "router": {
                 "workflows_tracked": len(self._table),
                 "inflight": dict(self._inflight),
@@ -491,10 +627,35 @@ class B02SketchRouterHandler:
             },
             "inflight": dict(self._inflight),
             "signal_gateway": self._gateway.snapshot(),
-            "zmq_relay": self._zmq_relay.snapshot() if self._zmq_relay is not None else None,
+            "zmq_relay": self._relay_snapshot(),
             "signal_ingress_events": self._stat_signal_ingress,
             "legacy_affinity_pin": self._args.legacy_affinity_pin,
         }
+
+    def _relay_snapshot(self) -> Optional[dict[str, Any]]:
+        if self._zmq_relay is not None:
+            return self._zmq_relay.snapshot()
+        if self._zmq_relay_processes:
+            return {
+                "mode": "process_sharded",
+                "shards": [
+                    {
+                        "pid": process.pid,
+                        "returncode": process.poll(),
+                        "snapshot": self._read_relay_snapshot(index),
+                    }
+                    for index, process in enumerate(self._zmq_relay_processes)
+                ],
+            }
+        return None
+
+    def _read_relay_snapshot(self, index: int) -> Optional[dict[str, Any]]:
+        try:
+            with open(self._zmq_relay_stats_files[index]) as handle:
+                value = json.load(handle)
+        except (FileNotFoundError, OSError, ValueError, IndexError):
+            return None
+        return value if isinstance(value, dict) else None
 
 
 @dynamo_worker()
