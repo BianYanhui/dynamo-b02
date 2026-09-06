@@ -58,6 +58,17 @@ def _block_lengths(token_ids: list[int], block_hashes: list[int], block_size: in
     return lengths
 
 
+def _normalized_i64_list(values: Any) -> list[int]:
+    """Normalize vLLM's hash list without copying the common signed path."""
+    if not values:
+        return []
+    if isinstance(values, list) and all(
+        isinstance(value, int) and value < 2**63 for value in values
+    ):
+        return values
+    return [_signed_i64(value) for value in values]
+
+
 class RawZmqSelectiveRelay:
     """Subscribe to vLLM raw ZMQ events and republish selected typed events."""
 
@@ -211,13 +222,18 @@ class RawZmqSelectiveRelay:
         return self._version[worker_id]
 
     def _stored_event(self, raw: dict[str, Any]) -> tuple[dict[str, Any], list[int]]:
-        hashes = [_signed_i64(value) for value in raw.get("block_hashes", [])]
-        tokens = [int(value) for value in raw.get("token_ids", [])]
+        hashes = _normalized_i64_list(raw.get("block_hashes"))
+        raw_tokens = raw.get("token_ids") or []
+        tokens = raw_tokens if isinstance(raw_tokens, list) else list(raw_tokens)
         block_size = int(raw.get("block_size", self.block_size))
+        if len(hashes) == 1:
+            block_lengths = [max(0, min(block_size, len(tokens)))]
+        else:
+            block_lengths = _block_lengths(tokens, hashes, block_size)
         typed = {
             "type": "stored",
             "token_ids": tokens,
-            "num_block_tokens": _block_lengths(tokens, hashes, block_size),
+            "num_block_tokens": block_lengths,
             "block_hashes": hashes,
             "parent_hash": (
                 _signed_i64(raw["parent_block_hash"])
@@ -237,12 +253,27 @@ class RawZmqSelectiveRelay:
 
     @staticmethod
     def _merge_stored(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
-        hashes = list(old["block_hashes"])
+        old_hashes = old["block_hashes"]
+        new_hashes = new["block_hashes"]
+
+        # vLLM normally reports a growing prefix as one or more blocks whose
+        # parent is the last block already held by the pending frame.  Keep
+        # this hot path incremental: copying the whole prefix on every block
+        # turns a long chain into quadratic work before it is published.
+        if old_hashes and new.get("parent_hash") == old_hashes[-1]:
+            old_hashes.extend(new_hashes)
+            old["token_ids"].extend(new["token_ids"])
+            old["num_block_tokens"].extend(new["num_block_tokens"])
+            return old
+
+        # Conservative fallback for reordered or overlapping reports.  These
+        # are uncommon but must retain the original de-duplication semantics.
+        hashes = list(old_hashes)
         existing = set(hashes)
         tokens = list(old["token_ids"])
         lengths = list(old["num_block_tokens"])
         offset = 0
-        for block_hash, token_count in zip(new["block_hashes"], new["num_block_tokens"]):
+        for block_hash, token_count in zip(new_hashes, new["num_block_tokens"]):
             current_offset = offset
             offset += token_count
             if block_hash in existing:
@@ -301,7 +332,7 @@ class RawZmqSelectiveRelay:
             if kind == "allblockscleared":
                 hashes = list(self._known_hashes[worker_id])
             else:
-                hashes = [_signed_i64(value) for value in raw.get("block_hashes", [])]
+                hashes = _normalized_i64_list(raw.get("block_hashes"))
             if not hashes:
                 return
             typed = {"type": "removed", "block_hashes": hashes}
