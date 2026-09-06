@@ -18,7 +18,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import msgspec
 import zmq
@@ -70,6 +70,10 @@ class RawZmqSelectiveRelay:
         block_size: int,
         gateway: SelectiveKVStateGateway,
         compatibility_scope: str = "default",
+        recv_hwm: int = 200_000,
+        max_messages_per_poll: int = 512,
+        max_events_per_batch: int = 4096,
+        drain_interval_ms: float = 2.0,
     ) -> None:
         if len(worker_ids) != len(ports):
             raise ValueError("worker_ids and ports must have the same length")
@@ -79,6 +83,14 @@ class RawZmqSelectiveRelay:
         self.block_size = int(block_size)
         self.gateway = gateway
         self.compatibility_scope = compatibility_scope
+        if recv_hwm <= 0 or max_messages_per_poll <= 0 or max_events_per_batch <= 0:
+            raise ValueError("relay batch and HWM settings must be positive")
+        if drain_interval_ms <= 0:
+            raise ValueError("drain_interval_ms must be positive")
+        self.recv_hwm = int(recv_hwm)
+        self.max_messages_per_poll = int(max_messages_per_poll)
+        self.max_events_per_batch = int(max_events_per_batch)
+        self.drain_interval_ns = int(float(drain_interval_ms) * 1_000_000)
         self.stats = RelayStats()
         self._publishers: dict[int, KvEventPublisher] = {}
         self._stop = threading.Event()
@@ -119,6 +131,10 @@ class RawZmqSelectiveRelay:
         return {
             "workers": self.worker_ids,
             "ports": self.ports,
+            "recv_hwm": self.recv_hwm,
+            "max_messages_per_poll": self.max_messages_per_poll,
+            "max_events_per_batch": self.max_events_per_batch,
+            "drain_interval_ms": self.drain_interval_ns / 1_000_000,
             "stats": self.stats.as_dict(),
             "gateway": self.gateway.snapshot(),
         }
@@ -127,36 +143,64 @@ class RawZmqSelectiveRelay:
     def _run(self) -> None:
         context = zmq.Context()
         poller = zmq.Poller()
+        decoder = msgspec.msgpack.Decoder()
         sockets: dict[Any, int] = {}
         for worker_id, port in zip(self.worker_ids, self.ports):
             socket = context.socket(zmq.SUB)
             socket.setsockopt(zmq.SUBSCRIBE, b"")
-            socket.setsockopt(zmq.RCVHWM, 200_000)
+            socket.setsockopt(zmq.RCVHWM, self.recv_hwm)
             socket.connect(f"tcp://127.0.0.1:{port}")
             poller.register(socket, zmq.POLLIN)
             sockets[socket] = worker_id
 
         try:
+            messages_since_drain = 0
+            events_since_drain = 0
+            last_drain_ns = time.monotonic_ns()
             while not self._stop.is_set():
                 for socket, _ in poller.poll(10):
                     worker_id = sockets[socket]
-                    while True:
+                    socket_messages = 0
+                    while socket_messages < self.max_messages_per_poll:
                         try:
                             parts = socket.recv_multipart(flags=zmq.NOBLOCK)
                         except zmq.Again:
                             break
+                        socket_messages += 1
+                        messages_since_drain += 1
                         self.stats.raw_messages += 1
                         try:
-                            payload = msgspec.msgpack.decode(parts[-1])
+                            payload = decoder.decode(parts[-1])
                             raw_events = payload[1]
                         except Exception:
                             self.stats.decode_errors += 1
                             continue
+                        event_timestamp_ns = time.time_ns()
                         for raw_event in raw_events:
                             self.stats.raw_events += 1
-                            self._ingest_raw(worker_id, raw_event)
-                        self._drain()
-                self._drain()
+                            self._ingest_raw(
+                                worker_id, raw_event, now_ns=event_timestamp_ns
+                            )
+                        events_since_drain += len(raw_events)
+                        now = time.monotonic_ns()
+                        if (
+                            events_since_drain >= self.max_events_per_batch
+                            or now - last_drain_ns >= self.drain_interval_ns
+                        ):
+                            self._drain()
+                            messages_since_drain = 0
+                            events_since_drain = 0
+                            last_drain_ns = now
+                now = time.monotonic_ns()
+                if (
+                    messages_since_drain
+                    and now - last_drain_ns >= self.drain_interval_ns
+                ):
+                    self._drain()
+                    messages_since_drain = 0
+                    events_since_drain = 0
+                    last_drain_ns = now
+            self._drain()
         finally:
             for socket in sockets:
                 socket.close(0)
@@ -213,9 +257,13 @@ class RawZmqSelectiveRelay:
         merged["num_block_tokens"] = lengths
         return merged
 
-    def _ingest_raw(self, worker_id: int, raw: dict[str, Any]) -> None:
+    def _ingest_raw(
+        self, worker_id: int, raw: dict[str, Any], *, now_ns: int | None = None
+    ) -> None:
         kind = str(raw.get("type", "")).lower()
         version = self._next_version(worker_id)
+        if now_ns is None:
+            now_ns = time.time_ns()
         if kind == "blockstored":
             typed, hashes = self._stored_event(raw)
             if not hashes:
@@ -237,7 +285,7 @@ class RawZmqSelectiveRelay:
                 compatibility_scope=self.compatibility_scope,
                 coverage_tokens=len(typed["token_ids"]),
                 version=version,
-                generated_at_ns=time.time_ns(),
+                generated_at_ns=now_ns,
                 kind="upsert",
                 frame_bytes=self.gateway.frame_bytes,
                 raw_event=typed,
@@ -264,7 +312,7 @@ class RawZmqSelectiveRelay:
                 compatibility_scope=self.compatibility_scope,
                 coverage_tokens=0,
                 version=version,
-                generated_at_ns=time.time_ns(),
+                generated_at_ns=now_ns,
                 kind="invalidate",
                 frame_bytes=self.gateway.frame_bytes,
                 raw_event=typed,
@@ -277,6 +325,9 @@ class RawZmqSelectiveRelay:
                 self._known_hashes[worker_id].discard(block_hash)
 
     def _drain(self) -> None:
+        if self.gateway.pending_count == 0:
+            return
+        batches: defaultdict[int, list[tuple[KVStateUpdate, Mapping[str, Any]]]] = defaultdict(list)
         for frame in self.gateway.select(top_k=64):
             raw = frame.raw_event
             if not raw:
@@ -284,12 +335,19 @@ class RawZmqSelectiveRelay:
             publisher = self._publishers.get(frame.owner_instance)
             if publisher is None:
                 continue
-            publisher.publish_batch([raw])
-            self.stats.forwarded_events += 1
-            if raw["type"] == "stored":
-                self.stats.forwarded_blocks += len(raw["block_hashes"])
-                self._known_hashes[frame.owner_instance].update(raw["block_hashes"])
-            else:
-                for block_hash in raw["block_hashes"]:
-                    self._known_hashes[frame.owner_instance].discard(block_hash)
-            self._pending_raw.pop(frame.key, None)
+            batches[frame.owner_instance].append((frame, raw))
+
+        for owner, items in batches.items():
+            publisher = self._publishers.get(owner)
+            if publisher is None:
+                continue
+            publisher.publish_batch([raw for _, raw in items])
+            self.stats.forwarded_events += len(items)
+            for frame, raw in items:
+                self._pending_raw.pop(frame.key, None)
+                if raw["type"] == "stored":
+                    self.stats.forwarded_blocks += len(raw["block_hashes"])
+                    self._known_hashes[frame.owner_instance].update(raw["block_hashes"])
+                else:
+                    for block_hash in raw["block_hashes"]:
+                        self._known_hashes[frame.owner_instance].discard(block_hash)
