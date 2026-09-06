@@ -260,7 +260,11 @@ class RawZmqSelectiveRelay:
         # parent is the last block already held by the pending frame.  Keep
         # this hot path incremental: copying the whole prefix on every block
         # turns a long chain into quadratic work before it is published.
-        if old_hashes and new.get("parent_hash") == old_hashes[-1]:
+        if (
+            old_hashes
+            and len(new_hashes) == 1
+            and new.get("parent_hash") == old_hashes[-1]
+        ):
             old_hashes.extend(new_hashes)
             old["token_ids"].extend(new["token_ids"])
             old["num_block_tokens"].extend(new["num_block_tokens"])
