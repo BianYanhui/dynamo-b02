@@ -266,6 +266,7 @@ class B02PrePublishEventPublisher:
     def shutdown(self) -> None:
         with self._lock:
             self._flush_locked()
+            logger.info("B02 pre-publish summary: %s", self._selector.stats.as_dict())
         self._delegate.shutdown()
 
     def snapshot(self) -> dict[str, Any]:
@@ -312,4 +313,3 @@ def install_b02_prepublish() -> bool:
         os.environ.get("DYN_B02_PREPUBLISH_MAX_EVENTS", "4096"),
     )
     return True
-
