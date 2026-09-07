@@ -383,9 +383,15 @@ def run_case(
         totals = {
             key: sum(item[key] for item in producer_stats)
             for key in producer_stats[0]
-            if key != "worker_id"
+            if key not in {"worker_id", "elapsed_s"}
         }
         expected_events = total_events_per_cycle * cycles
+        transport_event_loss = max(
+            totals["output_events"] - receiver_stats["received_events"], 0
+        )
+        selector_reduced_events = max(
+            expected_events - totals["output_events"], 0
+        )
         return {
             "mode": mode,
             "target_events_per_s": target_events_per_s,
@@ -393,6 +399,9 @@ def run_case(
             "events_per_cycle": total_events_per_cycle,
             "expected_input_events": expected_events,
             "producer_elapsed_s": round(elapsed, 6),
+            "producer_elapsed_sum_s": round(
+                sum(item["elapsed_s"] for item in producer_stats), 6
+            ),
             **totals,
             **receiver_stats,
             "input_events_per_s": round(totals["input_events"] / elapsed, 1),
@@ -403,9 +412,12 @@ def run_case(
             "estimated_message_loss": max(
                 totals["sent_messages"] - receiver_stats["received_messages"], 0
             ),
-            "input_event_loss": max(
-                expected_events - receiver_stats["received_events"], 0
-            ),
+            # For native, this is the event loss at the ZMQ receiver.  For
+            # B02, output_events is already reduced by local selection, so
+            # using output_events avoids mislabeling selector reductions as
+            # transport loss.
+            "transport_event_loss": transport_event_loss,
+            "selector_reduced_events": selector_reduced_events,
             "producer_details": producer_stats,
         }
     finally:
