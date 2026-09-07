@@ -45,6 +45,27 @@ def _raw(event: BlockStored) -> dict[str, Any]:
     }
 
 
+def _build_events(
+    pattern: str, worker_id: int, sequence: int, events_per_envelope: int
+) -> list[BlockStored]:
+    events: list[BlockStored] = []
+    for event_id in range(events_per_envelope):
+        block_hash = (
+            worker_id * 1_000_000_000
+            + sequence * events_per_envelope
+            + event_id
+            + 100
+        )
+        if pattern == "duplicate":
+            block_hash = worker_id * 1_000_000 + 7
+        # "unique" deliberately disables the parent chain so the selector
+        # cannot merge adjacent BlockStored records.  It is the worst-case
+        # CPU/input path for a worker-local pre-publish selector.
+        parent = None if pattern in ("duplicate", "unique") else block_hash - 1
+        events.append(BlockStored([block_hash], parent))
+    return events
+
+
 def _build_ring(
     pattern: str, worker_id: int, events_per_envelope: int, ring_size: int = 64
 ) -> tuple[list[bytes], list[list[BlockStored]]]:
@@ -52,20 +73,7 @@ def _build_ring(
     payloads: list[bytes] = []
     event_batches: list[list[BlockStored]] = []
     for envelope_id in range(ring_size):
-        events: list[BlockStored] = []
-        for event_id in range(events_per_envelope):
-            if pattern == "duplicate":
-                block_hash = worker_id * 1_000_000 + 7
-                parent = None
-            else:
-                block_hash = (
-                    worker_id * 1_000_000
-                    + envelope_id * events_per_envelope
-                    + event_id
-                    + 100
-                )
-                parent = block_hash - 1 if event_id else None
-            events.append(BlockStored([block_hash], parent))
+        events = _build_events(pattern, worker_id, envelope_id, events_per_envelope)
         payloads.append(encoder.encode([time.time(), [_raw(e) for e in events], 0]))
         event_batches.append(events)
     return payloads, event_batches
@@ -173,12 +181,31 @@ def _producer(
     sequence = 0
     try:
         while time.monotonic() < deadline:
-            ring_index = sequence % len(payloads)
             selected_events: list[BlockStored]
-            if selector is None:
+            if pattern == "unique":
+                selected_events = _build_events(
+                    pattern, worker_id, sequence, events_per_envelope
+                )
+                payload = encoder.encode([time.time(), [_raw(e) for e in selected_events], 0])
+                if selector is not None:
+                    selector.ingest(selected_events)
+                    selected_events = []
+                    now = time.monotonic_ns()
+                    if now - last_flush >= 2_000_000:
+                        selected_events = selector.flush()
+                        last_flush = now
+                    if selected_events:
+                        payload = encoder.encode(
+                            [time.time(), [_raw(e) for e in selected_events], 0]
+                        )
+                    else:
+                        payload = None
+            elif selector is None:
+                ring_index = sequence % len(payloads)
                 payload = payloads[ring_index]
                 selected_events = event_batches[ring_index]
             else:
+                ring_index = sequence % len(payloads)
                 selector.ingest(event_batches[ring_index])
                 now = time.monotonic_ns()
                 if now - last_flush >= 2_000_000:
@@ -343,7 +370,9 @@ def main() -> None:
     parser.add_argument("--modes", default="native,b02-thread,b02-process")
     parser.add_argument("--publishers", default="1,4,8,16")
     parser.add_argument("--envelope-events", default="1,16,64")
-    parser.add_argument("--pattern", choices=("duplicate", "chain"), default="chain")
+    parser.add_argument(
+        "--pattern", choices=("duplicate", "chain", "unique"), default="chain"
+    )
     parser.add_argument("--duration", type=float, default=2.0)
     parser.add_argument("--base-port", type=int, default=26000)
     parser.add_argument("--out", default="/tmp/b02_prepublish_scaling.json")
