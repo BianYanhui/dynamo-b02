@@ -37,28 +37,15 @@ _KIND_CLEARED = 3
 _EVENT_KIND_CACHE: dict[type[Any], int] = {}
 
 
-def _event_kind(event: Any) -> int:
-    """Return a cached integer tag instead of allocating a lowercase string."""
-    event_type = type(event)
-    kind = _EVENT_KIND_CACHE.get(event_type)
-    if kind is not None:
-        return kind
+def _kind_for_type(event_type: type[Any]) -> int:
     name = event_type.__name__
     if name == "BlockStored":
-        kind = _KIND_STORED
-    elif name == "BlockRemoved":
-        kind = _KIND_REMOVED
-    elif name == "AllBlocksCleared":
-        kind = _KIND_CLEARED
-    else:
-        kind = _KIND_UNKNOWN
-    _EVENT_KIND_CACHE[event_type] = kind
-    return kind
-
-
-def _block_hashes(event: Any) -> Sequence[Any]:
-    values = getattr(event, "block_hashes", None)
-    return () if values is None else values
+        return _KIND_STORED
+    if name == "BlockRemoved":
+        return _KIND_REMOVED
+    if name == "AllBlocksCleared":
+        return _KIND_CLEARED
+    return _KIND_UNKNOWN
 
 
 def _copy_event(event: Any, **updates: Any) -> Any:
@@ -93,6 +80,7 @@ class LocalKVEventSelector:
         self.max_pending_events = int(max_pending_events)
         self.stats = PrePublishStats()
         self._pending: list[Any] = []
+        self._pending_last_kind = _KIND_UNKNOWN
         self._known_hashes: set[Any] = set()
         self._removed_hashes: set[Any] = set()
 
@@ -103,7 +91,11 @@ class LocalKVEventSelector:
     def ingest(self, events: Sequence[Any]) -> None:
         self.stats.input_events += len(events)
         for event in events:
-            kind = _event_kind(event)
+            event_type = type(event)
+            kind = _EVENT_KIND_CACHE.get(event_type)
+            if kind is None:
+                kind = _kind_for_type(event_type)
+                _EVENT_KIND_CACHE[event_type] = kind
             if kind == _KIND_STORED:
                 self._ingest_stored(event)
             elif kind == _KIND_REMOVED:
@@ -115,23 +107,29 @@ class LocalKVEventSelector:
                 self._known_hashes.clear()
                 self._removed_hashes.clear()
                 self._pending.append(event)
+                self._pending_last_kind = _KIND_CLEARED
                 self.stats.invalidation_events += 1
             else:
                 self._pending.append(event)
+                self._pending_last_kind = kind
 
     def flush(self) -> list[Any]:
         events = self._pending
         self._pending = []
+        self._pending_last_kind = _KIND_UNKNOWN
         self.stats.output_events += len(events)
         return events
 
     def _ingest_stored(self, event: Any) -> None:
-        hashes = _block_hashes(event)
+        hashes = getattr(event, "block_hashes", None)
+        if hashes is None:
+            hashes = ()
+        hash_count = len(hashes)
         if hashes:
             # The one-block case dominates normal KV traffic.  Avoid creating
             # a generator for it; keep the general path for multi-block
             # events such as prefix snapshots.
-            if len(hashes) == 1:
+            if hash_count == 1:
                 if hashes[0] in self._known_hashes:
                     self.stats.duplicate_events += 1
                     return
@@ -143,14 +141,23 @@ class LocalKVEventSelector:
         # only some blocks is version-sensitive in vLLM and can corrupt the
         # block/token alignment.  The common one-block duplicate path above is
         # the hot path, while safety wins for mixed batches.
-        self._removed_hashes.difference_update(hashes)
-        if self._pending and _event_kind(self._pending[-1]) == _KIND_STORED:
-            previous = self._pending[-1]
-            previous_hashes = _block_hashes(previous)
+        if self._removed_hashes:
+            if hash_count == 1:
+                self._removed_hashes.discard(hashes[0])
+            else:
+                self._removed_hashes.difference_update(hashes)
+        if self._pending_last_kind == _KIND_STORED and hash_count == 1:
             parent = getattr(event, "parent_block_hash", None)
+        else:
+            parent = None
+        if self._pending_last_kind == _KIND_STORED and parent is not None:
+            previous = self._pending[-1]
+            previous_hashes = getattr(previous, "block_hashes", None)
+            if previous_hashes is None:
+                previous_hashes = ()
             if (
                 previous_hashes
-                and len(hashes) == 1
+                and hash_count == 1
                 and parent == previous_hashes[-1]
                 and getattr(previous, "block_size", None)
                 == getattr(event, "block_size", None)
@@ -173,16 +180,23 @@ class LocalKVEventSelector:
                     )
                 self._pending[-1] = merged
                 self.stats.merged_events += 1
-                self._known_hashes.update(hashes)
+                self._known_hashes.add(hashes[0])
                 return
 
         self._pending.append(event)
-        self._known_hashes.update(hashes)
+        if hash_count == 1:
+            self._known_hashes.add(hashes[0])
+        else:
+            self._known_hashes.update(hashes)
+        self._pending_last_kind = _KIND_STORED
 
     def _ingest_removed(self, event: Any) -> None:
-        hashes = _block_hashes(event)
+        hashes = getattr(event, "block_hashes", None)
+        if hashes is None:
+            hashes = ()
+        hash_count = len(hashes)
         if hashes:
-            if len(hashes) == 1:
+            if hash_count == 1:
                 block_hash = hashes[0]
                 if block_hash in self._removed_hashes:
                     self.stats.duplicate_events += 1
@@ -190,6 +204,7 @@ class LocalKVEventSelector:
                 self._removed_hashes.add(block_hash)
                 self._known_hashes.discard(block_hash)
                 self._pending.append(event)
+                self._pending_last_kind = _KIND_REMOVED
                 self.stats.invalidation_events += 1
                 return
             fresh = [block_hash for block_hash in hashes if block_hash not in self._removed_hashes]
@@ -201,6 +216,7 @@ class LocalKVEventSelector:
             self._removed_hashes.update(fresh)
             self._known_hashes.difference_update(fresh)
         self._pending.append(event)
+        self._pending_last_kind = _KIND_REMOVED
         self.stats.invalidation_events += 1
 
     def should_flush(self) -> bool:
