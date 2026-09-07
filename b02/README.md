@@ -59,6 +59,21 @@ process-sharded mode keeps owner-side validation safety but performs
 redundancy suppression within each shard. Use sharding only when raw ingress
 is the limiting factor and validate the resulting downstream hint volume.
 
+For the original ZMQ-ingress experiment, enable the Worker-local pre-publish
+path:
+
+```bash
+DYN_B02_PREPUBLISH=1 KV_EVENTS=1 GPU_MEM_UTIL=0.60 bash /home/byh/Dynamo/dynamo/b02/smoke/cluster_up.sh
+```
+
+This wraps vLLM's publisher before its ZMQ socket. It merges adjacent local
+`BlockStored` extensions, suppresses already-published local duplicates,
+coalesces scheduler batches, and gives clears/removals priority over pending
+positive updates. It deliberately does not suppress replicas across Workers;
+that decision requires the downstream B02 gateway's global visibility. Each
+Worker logs `B02 pre-publish summary` during shutdown with input/output event
+and byte counts.
+
 ## Tests
 
 On yhs1:
@@ -69,6 +84,7 @@ source /home/byh/Dynamo/.venv-dynamo/bin/activate
 PYTHONPATH=b02 python b02/tests/test_selective_signaling.py
 PYTHONPATH=b02 python b02/tests/test_zmq_gateway.py
 PYTHONPATH=b02 python b02/tests/test_state_views.py  # legacy builder regression
+PYTHONPATH=b02 python b02/tests/test_prepublish.py
 ```
 
 For the full smoke test, start the existing four-worker cluster and run:

@@ -56,6 +56,7 @@ from dynamo.vllm.worker_factory import WorkerFactory
 from . import envs
 from .args import Config, _uses_dynamo_connector, configure_rl_logprobs_mode, parse_args
 from .cache_info import get_configured_kv_event_block_size
+from .b02_prepublish import install_b02_prepublish
 from .capacity import (
     get_metrics_model_name,
     get_spec_decode_runtime_data,
@@ -712,6 +713,7 @@ def setup_vllm_engine(
 
     # Time engine initialization
     start_time = time.time()
+    install_b02_prepublish()
     embedding_process_group = None
     if config.embedding_worker and config.embedding_worker_processes > 1:
         (

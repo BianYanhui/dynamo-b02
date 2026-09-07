@@ -3,6 +3,7 @@
 # Usage: bash /home/byh/Dynamo/cluster_up.sh
 #   KV_EVENTS=1  -> workers publish KV block events on ZMQ ports 20081-20084
 #   GPU_MEM_UTIL=0.60 -> adjust per-worker VRAM fraction
+#   DYN_B02_PREPUBLISH=1 -> filter KV events before the Worker ZMQ PUB
 set -u
 cd /home/byh/Dynamo
 source .venv-dynamo/bin/activate
