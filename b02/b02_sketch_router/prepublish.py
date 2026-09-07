@@ -22,6 +22,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -29,15 +30,35 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 
-def _event_kind(event: Any) -> str:
-    return type(event).__name__.lower()
+_KIND_UNKNOWN = 0
+_KIND_STORED = 1
+_KIND_REMOVED = 2
+_KIND_CLEARED = 3
+_EVENT_KIND_CACHE: dict[type[Any], int] = {}
 
 
-def _block_hashes(event: Any) -> list[Any]:
+def _event_kind(event: Any) -> int:
+    """Return a cached integer tag instead of allocating a lowercase string."""
+    event_type = type(event)
+    kind = _EVENT_KIND_CACHE.get(event_type)
+    if kind is not None:
+        return kind
+    name = event_type.__name__
+    if name == "BlockStored":
+        kind = _KIND_STORED
+    elif name == "BlockRemoved":
+        kind = _KIND_REMOVED
+    elif name == "AllBlocksCleared":
+        kind = _KIND_CLEARED
+    else:
+        kind = _KIND_UNKNOWN
+    _EVENT_KIND_CACHE[event_type] = kind
+    return kind
+
+
+def _block_hashes(event: Any) -> Sequence[Any]:
     values = getattr(event, "block_hashes", None)
-    if values is None:
-        return []
-    return list(values)
+    return () if values is None else values
 
 
 def _copy_event(event: Any, **updates: Any) -> Any:
@@ -79,15 +100,15 @@ class LocalKVEventSelector:
     def pending_count(self) -> int:
         return len(self._pending)
 
-    def ingest(self, events: list[Any]) -> None:
+    def ingest(self, events: Sequence[Any]) -> None:
         self.stats.input_events += len(events)
         for event in events:
             kind = _event_kind(event)
-            if kind == "blockstored":
+            if kind == _KIND_STORED:
                 self._ingest_stored(event)
-            elif kind == "blockremoved":
+            elif kind == _KIND_REMOVED:
                 self._ingest_removed(event)
-            elif kind == "allblockscleared":
+            elif kind == _KIND_CLEARED:
                 # A clear supersedes all positive updates that have not yet
                 # crossed the ZMQ boundary.
                 self._pending.clear()
@@ -106,16 +127,24 @@ class LocalKVEventSelector:
 
     def _ingest_stored(self, event: Any) -> None:
         hashes = _block_hashes(event)
-        if hashes and all(block_hash in self._known_hashes for block_hash in hashes):
-            self.stats.duplicate_events += 1
-            return
+        if hashes:
+            # The one-block case dominates normal KV traffic.  Avoid creating
+            # a generator for it; keep the general path for multi-block
+            # events such as prefix snapshots.
+            if len(hashes) == 1:
+                if hashes[0] in self._known_hashes:
+                    self.stats.duplicate_events += 1
+                    return
+            elif all(block_hash in self._known_hashes for block_hash in hashes):
+                self.stats.duplicate_events += 1
+                return
 
         # A partial duplicate is retained unchanged.  Trimming token_ids for
         # only some blocks is version-sensitive in vLLM and can corrupt the
         # block/token alignment.  The common one-block duplicate path above is
         # the hot path, while safety wins for mixed batches.
         self._removed_hashes.difference_update(hashes)
-        if self._pending and _event_kind(self._pending[-1]) == "blockstored":
+        if self._pending and _event_kind(self._pending[-1]) == _KIND_STORED:
             previous = self._pending[-1]
             previous_hashes = _block_hashes(previous)
             parent = getattr(event, "parent_block_hash", None)
@@ -130,7 +159,7 @@ class LocalKVEventSelector:
             ):
                 merged = _copy_event(
                     previous,
-                    block_hashes=previous_hashes + hashes,
+                    block_hashes=[*previous_hashes, *hashes],
                     token_ids=list(getattr(previous, "token_ids", []))
                     + list(getattr(event, "token_ids", [])),
                 )
@@ -153,6 +182,16 @@ class LocalKVEventSelector:
     def _ingest_removed(self, event: Any) -> None:
         hashes = _block_hashes(event)
         if hashes:
+            if len(hashes) == 1:
+                block_hash = hashes[0]
+                if block_hash in self._removed_hashes:
+                    self.stats.duplicate_events += 1
+                    return
+                self._removed_hashes.add(block_hash)
+                self._known_hashes.discard(block_hash)
+                self._pending.append(event)
+                self.stats.invalidation_events += 1
+                return
             fresh = [block_hash for block_hash in hashes if block_hash not in self._removed_hashes]
             if not fresh:
                 self.stats.duplicate_events += 1
@@ -206,6 +245,12 @@ class B02PrePublishEventPublisher:
         self._last_flush_ns = time.monotonic_ns()
         self._pending_ts: float | None = None
         self._lock = threading.Lock()
+        # Exact wire-size accounting serializes every input and output batch
+        # again.  It is useful for diagnostics but too expensive for the hot
+        # path, so production defaults to counters-only mode.
+        self._measure_wire_bytes = (
+            os.environ.get("DYN_B02_PREPUBLISH_MEASURE_BYTES", "0") == "1"
+        )
         self._encoder: Any | None = None
         self._event_batch_type: Any | None = None
 
@@ -214,6 +259,8 @@ class B02PrePublishEventPublisher:
         return self._selector.stats
 
     def _wire_size(self, batch: Any) -> int:
+        if not self._measure_wire_bytes:
+            return 0
         try:
             if self._encoder is None:
                 import msgspec
@@ -255,7 +302,7 @@ class B02PrePublishEventPublisher:
             self._selector.stats.input_bytes += self._wire_size(batch)
             if self._pending_ts is None:
                 self._pending_ts = float(getattr(batch, "ts", time.time()))
-            self._selector.ingest(list(getattr(batch, "events", [])))
+            self._selector.ingest(getattr(batch, "events", ()) or ())
             now = time.monotonic_ns()
             if (
                 self._selector.should_flush()
@@ -275,6 +322,7 @@ class B02PrePublishEventPublisher:
                 "rank": self._rank,
                 "pending_events": self._selector.pending_count,
                 "flush_interval_ms": self._flush_interval_ns / 1_000_000,
+                "measure_wire_bytes": self._measure_wire_bytes,
                 "stats": self._selector.stats.as_dict(),
             }
 
@@ -308,8 +356,9 @@ def install_b02_prepublish() -> bool:
     setattr(constructor, "_b02_prepublish", True)
     registry["zmq"] = constructor
     logger.info(
-        "B02 worker-local pre-publish enabled (flush_ms=%s, max_events=%s)",
+        "B02 worker-local pre-publish enabled (flush_ms=%s, max_events=%s, measure_wire_bytes=%s)",
         os.environ.get("DYN_B02_PREPUBLISH_FLUSH_MS", "2.0"),
         os.environ.get("DYN_B02_PREPUBLISH_MAX_EVENTS", "4096"),
+        os.environ.get("DYN_B02_PREPUBLISH_MEASURE_BYTES", "0"),
     )
     return True
