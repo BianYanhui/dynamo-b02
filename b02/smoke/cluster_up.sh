@@ -15,6 +15,11 @@ export LD_LIBRARY_PATH=/home/byh/cuda13-compat:$NV13${LD_LIBRARY_PATH:+:$LD_LIBR
 MODEL=Qwen/Qwen2.5-1.5B-Instruct
 GPUMEM=${GPU_MEM_UTIL:-0.90}
 KV_EVENTS=${KV_EVENTS:-0}
+DYN_B02_PREPUBLISH=${DYN_B02_PREPUBLISH:-0}
+WORKER_ENV=()
+if [ "$DYN_B02_PREPUBLISH" = "1" ]; then
+  WORKER_ENV=(DYN_B02_WORKER=1 PYTHONPATH="/home/byh/Dynamo/dynamo/b02${PYTHONPATH:+:$PYTHONPATH}")
+fi
 
 # frontend
 setsid nohup python -m dynamo.frontend --http-port 8000 --router-mode kv \
@@ -27,7 +32,7 @@ for G in 0 1 2 3; do
     PORT=$((20081 + G))
     EXTRA="--kv-events-config {\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:$PORT\",\"enable_kv_cache_events\":true}"
   fi
-  CUDA_VISIBLE_DEVICES=$G setsid nohup python -m dynamo.vllm \
+  env "${WORKER_ENV[@]}" CUDA_VISIBLE_DEVICES=$G setsid nohup python -m dynamo.vllm \
       --model $MODEL --dtype half --gpu-memory-utilization $GPUMEM \
       $EXTRA \
       > /tmp/dyn_worker_$G.log 2>&1 < /dev/null &
