@@ -1,0 +1,16 @@
+[package]
+name = "kv-event-selector"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+# Keep this small Python extension independent from Dynamo's root workspace.
+
+[lib]
+name = "kv_event_selector"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23.4", features = ["extension-module"] }
+smallvec = "1"

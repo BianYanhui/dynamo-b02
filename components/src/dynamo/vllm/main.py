@@ -56,7 +56,7 @@ from dynamo.vllm.worker_factory import WorkerFactory
 from . import envs
 from .args import Config, _uses_dynamo_connector, configure_rl_logprobs_mode, parse_args
 from .cache_info import get_configured_kv_event_block_size
-from .b02_prepublish import install_b02_prepublish
+from .kv_event_prepublish import install_kv_event_prepublish
 from .capacity import (
     get_metrics_model_name,
     get_spec_decode_runtime_data,
@@ -474,13 +474,13 @@ def setup_kv_event_publisher(
         )
         return None
 
-    # B02 can take ownership of the raw vLLM ZMQ stream and republish
+    # KV event can take ownership of the raw vLLM ZMQ stream and republish
     # selectively through its own KvEventPublisher.  Keep vLLM's raw event
     # producer enabled, but avoid creating the ordinary worker-side relay so
     # the dispatcher cannot subscribe to both the raw and filtered paths.
-    if os.environ.get("DYN_B02_EVENT_GATEWAY", "0") == "1":
+    if os.environ.get("DYN_KV_EVENT_GATEWAY", "0") == "1":
         logger.info(
-            "DYN_B02_EVENT_GATEWAY=1: deferring KV event relay to the B02 gateway"
+            "DYN_KV_EVENT_GATEWAY=1: deferring KV event relay to the KV event gateway"
         )
         return None
 
@@ -739,7 +739,7 @@ def setup_vllm_engine(
 
     # Time engine initialization
     start_time = time.time()
-    install_b02_prepublish()
+    install_kv_event_prepublish()
     embedding_process_group = None
     if config.embedding_worker and config.embedding_worker_processes > 1:
         (
