@@ -74,6 +74,26 @@ that decision requires the downstream B02 gateway's global visibility. Each
 Worker logs `B02 pre-publish summary` during shutdown with input/output event
 and byte counts.
 
+The selector has an optional Rust backend. `auto` is the default: it uses the
+Rust extension when installed and falls back to the Python selector otherwise.
+Use `DYN_B02_PREPUBLISH_BACKEND=python` to force the fallback or `rust` to fail
+fast when the extension is unavailable. Build the extension in the worker
+environment with:
+
+```bash
+cd /home/byh/Dynamo/dynamo/b02/rust_selector
+export PATH=/home/byh/.cargo/bin:/home/byh/.local/bin:$PATH
+RUSTUP_TOOLCHAIN=1.96.1 maturin build --release --manifest-path Cargo.toml \
+  --interpreter /home/byh/Dynamo/.venv-dynamo/bin/python
+/home/byh/Dynamo/.venv-dynamo/bin/python -m pip install --force-reinstall \
+  target/wheels/b02_rust_selector-*.whl
+```
+
+The Rust backend preserves the Python event-object API and keeps Python as a
+runtime fallback. It moves event-kind dispatch, hash tracking, duplicate
+suppression, invalidation handling, and adjacent `BlockStored` merging into a
+compiled selector; ZMQ publishing remains in the existing publisher wrapper.
+
 ## Tests
 
 On yhs1:
@@ -85,6 +105,16 @@ PYTHONPATH=b02 python b02/tests/test_selective_signaling.py
 PYTHONPATH=b02 python b02/tests/test_zmq_gateway.py
 PYTHONPATH=b02 python b02/tests/test_state_views.py  # legacy builder regression
 PYTHONPATH=b02 python b02/tests/test_prepublish.py
+```
+
+To compare the same native-shaped trace across all paths:
+
+```bash
+PYTHONPATH=b02 python b02/smoke/benchmark_native_vs_b02_stress.py \
+  --trace /tmp/native_event_trace_highconc.jsonl \
+  --modes native,b02-python,b02-rust \
+  --target-events-per-s 115000,150000 --cycles 1000 \
+  --out /tmp/native_vs_python_rust_b02.json
 ```
 
 For the full smoke test, start the existing four-worker cluster and run:

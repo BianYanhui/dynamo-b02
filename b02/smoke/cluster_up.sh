@@ -4,6 +4,7 @@
 #   KV_EVENTS=1  -> workers publish KV block events on ZMQ ports 20081-20084
 #   GPU_MEM_UTIL=0.60 -> adjust per-worker VRAM fraction
 #   DYN_B02_PREPUBLISH=1 -> filter KV events before the Worker ZMQ PUB
+#   DYN_B02_PREPUBLISH_BACKEND=rust|python|auto -> selector implementation
 set -u
 cd /home/byh/Dynamo
 source .venv-dynamo/bin/activate
@@ -16,9 +17,14 @@ MODEL=Qwen/Qwen2.5-1.5B-Instruct
 GPUMEM=${GPU_MEM_UTIL:-0.90}
 KV_EVENTS=${KV_EVENTS:-0}
 DYN_B02_PREPUBLISH=${DYN_B02_PREPUBLISH:-0}
+DYN_B02_PREPUBLISH_BACKEND=${DYN_B02_PREPUBLISH_BACKEND:-auto}
 WORKER_ENV=()
 if [ "$DYN_B02_PREPUBLISH" = "1" ]; then
-  WORKER_ENV=(DYN_B02_WORKER=1 PYTHONPATH="/home/byh/Dynamo/dynamo/b02${PYTHONPATH:+:$PYTHONPATH}")
+  WORKER_ENV=(
+    DYN_B02_WORKER=1
+    DYN_B02_PREPUBLISH_BACKEND="$DYN_B02_PREPUBLISH_BACKEND"
+    PYTHONPATH="/home/byh/Dynamo/dynamo/b02${PYTHONPATH:+:$PYTHONPATH}"
+  )
 fi
 
 # frontend

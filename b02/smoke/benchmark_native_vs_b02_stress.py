@@ -177,6 +177,7 @@ def _producer(
     worker_index: int,
     port: int,
     mode: str,
+    backend: str,
     templates: list[dict[str, Any]],
     cycles: int,
     cycle_interval_s: float,
@@ -197,8 +198,12 @@ def _producer(
         ctx.term()
         return
 
-    selector = LocalKVEventSelector(max_pending_events=4096) if mode == "b02" else None
-    decoder = msgspec.msgpack.Decoder() if mode == "b02" else None
+    selector = (
+        LocalKVEventSelector(max_pending_events=4096, backend=backend)
+        if mode != "native"
+        else None
+    )
+    decoder = msgspec.msgpack.Decoder() if mode != "native" else None
     encoder = msgspec.msgpack.Encoder()
 
     # Build the identical logical workload before starting the timer.  This is
@@ -306,6 +311,7 @@ def _producer(
 def run_case(
     *,
     mode: str,
+    backend: str,
     trace: dict[int, list[dict[str, Any]]],
     cycles: int,
     target_events_per_s: float,
@@ -346,6 +352,7 @@ def run_case(
                     index,
                     ports[index],
                     mode,
+                    backend,
                     trace[worker_id],
                     cycles,
                     cycle_interval,
@@ -394,6 +401,7 @@ def run_case(
         )
         return {
             "mode": mode,
+            "backend": backend if mode != "native" else "native",
             "target_events_per_s": target_events_per_s,
             "cycles": cycles,
             "events_per_cycle": total_events_per_cycle,
@@ -434,7 +442,11 @@ def run_case(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", required=True)
-    ap.add_argument("--modes", default="native,b02")
+    ap.add_argument(
+        "--modes",
+        default="native,b02-python,b02-rust",
+        help="native, b02-python, and/or b02-rust",
+    )
     ap.add_argument("--target-events-per-s", required=True)
     ap.add_argument("--cycles", type=int, default=1000)
     ap.add_argument("--flush-ms", type=float, default=2.0)
@@ -452,8 +464,19 @@ def main() -> None:
     case_id = 0
     for rate in rates:
         for mode in [item.strip() for item in args.modes.split(",") if item.strip()]:
+            if mode in {"native"}:
+                backend = "python"
+            elif mode in {"b02", "b02-python", "python"}:
+                mode = "b02-python"
+                backend = "python"
+            elif mode in {"b02-rust", "rust"}:
+                mode = "b02-rust"
+                backend = "rust"
+            else:
+                raise ValueError(f"unsupported mode: {mode}")
             result = run_case(
                 mode=mode,
+                backend=backend,
                 trace=trace,
                 cycles=args.cycles,
                 target_events_per_s=rate,

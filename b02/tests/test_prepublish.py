@@ -61,6 +61,36 @@ def test_clear_drops_unsent_positive_updates():
     assert [type(event).__name__ for event in events] == ["AllBlocksCleared"]
 
 
+def test_rust_backend_matches_python_backend():
+    try:
+        rust_selector = LocalKVEventSelector(backend="rust")
+    except RuntimeError:
+        return
+
+    def run(selector):
+        selector.ingest(
+            [
+                BlockStored([10], token_ids=[1, 2]),
+                BlockStored([11], parent_block_hash=10, token_ids=[3, 4]),
+                BlockStored([11], parent_block_hash=10, token_ids=[3, 4]),
+                BlockRemoved([10]),
+                BlockRemoved([10]),
+            ]
+        )
+        return selector.flush(), selector.stats.as_dict()
+
+    python_events, python_stats = run(LocalKVEventSelector(backend="python"))
+    rust_events, rust_stats = run(rust_selector)
+
+    assert [type(event).__name__ for event in python_events] == [
+        type(event).__name__ for event in rust_events
+    ]
+    assert [event.__dict__ for event in python_events] == [
+        event.__dict__ for event in rust_events
+    ]
+    assert python_stats == rust_stats
+
+
 if __name__ == "__main__":
     test_merge_adjacent_prefix_extensions()
     test_duplicate_store_and_remove_are_suppressed()

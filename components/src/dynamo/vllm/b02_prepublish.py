@@ -66,20 +66,73 @@ class PrePublishStats:
 class LocalKVEventSelector:
     """Lossless local event reduction for one vLLM data-parallel publisher."""
 
-    def __init__(self, *, max_pending_events: int = 4096) -> None:
+    def __init__(
+        self,
+        *,
+        max_pending_events: int = 4096,
+        backend: str | None = None,
+    ) -> None:
         if max_pending_events <= 0:
             raise ValueError("max_pending_events must be positive")
         self.max_pending_events = int(max_pending_events)
         self.stats = PrePublishStats()
+        requested_backend = backend or os.environ.get(
+            "DYN_B02_PREPUBLISH_BACKEND", "auto"
+        )
+        if requested_backend not in {"auto", "python", "rust"}:
+            raise ValueError(
+                "DYN_B02_PREPUBLISH_BACKEND must be one of auto, python, rust"
+            )
+        self._rust_selector: Any | None = None
+        self.backend = "python"
+        if requested_backend in {"auto", "rust"}:
+            try:
+                from b02_rust_selector import RustKVEventSelector
+            except ImportError:
+                if requested_backend == "rust":
+                    raise RuntimeError(
+                        "Rust B02 backend requested but b02_rust_selector is not installed"
+                    ) from None
+            else:
+                self._rust_selector = RustKVEventSelector(max_pending_events)
+                self.backend = "rust"
         self._pending: list[Any] = []
         self._known_hashes: set[Any] = set()
         self._removed_hashes: set[Any] = set()
 
+    def _sync_rust_stats(self) -> None:
+        if self._rust_selector is None:
+            return
+        values = self._rust_selector.stats()
+        for name in (
+            "input_batches",
+            "input_events",
+            "output_batches",
+            "output_events",
+            "merged_events",
+            "duplicate_events",
+            "invalidation_events",
+        ):
+            setattr(self.stats, name, int(values.get(name, 0)))
+
+    def record_input_batch(self) -> None:
+        if self._rust_selector is not None:
+            self._rust_selector.record_input_batch()
+            self._sync_rust_stats()
+        else:
+            self.stats.input_batches += 1
+
     @property
     def pending_count(self) -> int:
+        if self._rust_selector is not None:
+            return int(self._rust_selector.pending_count())
         return len(self._pending)
 
     def ingest(self, events: list[Any]) -> None:
+        if self._rust_selector is not None:
+            self._rust_selector.ingest(events)
+            self._sync_rust_stats()
+            return
         self.stats.input_events += len(events)
         for event in events:
             kind = _event_kind(event)
@@ -99,9 +152,15 @@ class LocalKVEventSelector:
                 self._pending.append(event)
 
     def flush(self) -> list[Any]:
+        if self._rust_selector is not None:
+            events = list(self._rust_selector.flush())
+            self._sync_rust_stats()
+            return events
         events = self._pending
         self._pending = []
         self.stats.output_events += len(events)
+        if events:
+            self.stats.output_batches += 1
         return events
 
     def _ingest_stored(self, event: Any) -> None:
@@ -165,6 +224,8 @@ class LocalKVEventSelector:
         self.stats.invalidation_events += 1
 
     def should_flush(self) -> bool:
+        if self._rust_selector is not None:
+            return bool(self._rust_selector.should_flush())
         return len(self._pending) >= self.max_pending_events
 
 
@@ -243,7 +304,6 @@ class B02PrePublishEventPublisher:
             events,
             self._pending_ts if self._pending_ts is not None else timestamp or time.time(),
         )
-        self._selector.stats.output_batches += 1
         self._selector.stats.output_bytes += self._wire_size(batch)
         self._delegate.publish(batch)
         self._pending_ts = None
@@ -251,7 +311,7 @@ class B02PrePublishEventPublisher:
 
     def publish(self, batch: Any) -> None:
         with self._lock:
-            self._selector.stats.input_batches += 1
+            self._selector.record_input_batch()
             self._selector.stats.input_bytes += self._wire_size(batch)
             if self._pending_ts is None:
                 self._pending_ts = float(getattr(batch, "ts", time.time()))
